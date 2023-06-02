@@ -54,6 +54,7 @@ class InvoiceGenerator:
         install(self, 'pandas')
         install(self, 'xlsxwriter')
         install(self, 'openpyxl')
+        install(self, 'unidecode')
 
     def run_auto_code(self):
         # Code for generating invoices goes here

@@ -16,6 +16,7 @@ from calendar import month_name as mn
 from os.path import exists
 import openpyxl
 from collections import defaultdict
+from unidecode import unidecode
 
 # Disable copy warnings
 pd.options.mode.chained_assignment = None
@@ -42,12 +43,22 @@ def reference_number_read():
     try:
         with open('ref_number_values.txt', 'r') as f:
             # Load configuration file values
-            lines_to_read = [2]
+            invoice_line = [2]
+            checks_line = [3]
+            journal_line = [4]
             for position, line in enumerate(f):
 
-                if position in lines_to_read:
+                if position in invoice_line:
                     invoice_str = re.findall('\d*\.?\d+', line)
                     invoice_number = int(float(invoice_str[0]))
+
+                elif position in checks_line:
+                    checks_str = re.findall('\d*\.?\d+', line)
+                    checks_number = int(float(checks_str[0]))
+
+                elif position in journal_line:
+                    journal_str = re.findall('\d*\.?\d+', line)
+                    journal_number = int(float(journal_str[0]))
 
     except FileNotFoundError:
         # Keep preset values
@@ -55,17 +66,22 @@ def reference_number_read():
         print()
 
         invoice_number = int(input('Please input the starting reference number for Invoices: \n'))
+        checks_number = int(input('Please input the starting reference number for Checks (Just the number value): \n'))
+        journal_number = int(
+            input('Please input the starting reference number for Journal Entries (Just the number value): \n'))
 
-    return invoice_number
+    return invoice_number, checks_number, journal_number
 
 
 # Create a function to write reference numbers
-def reference_number_write(invoice_no, mo, yr):
+def reference_number_write(invoice_no, check_no, journal_no, mo, yr):
     with open('ref_number_values.txt', 'w') as f:
         # Print date
         f.write("LIN date: " + str(mo) + "/" + str(yr) + "\n\n")
         # Load reference numbers
-        f.write("Reference number (Invoice): " + str(invoice_no))
+        f.write("Reference number (Invoice): " + f"{invoice_no}" + "\n")
+        f.write("Reference number (Checks): ABB TR " + f"{check_no:05d}" + "\n")
+        f.write("Reference number (Journal): PMT " + f"{journal_no:05d}" + "\n")
 
 
 # Define an explanation function for missing data
@@ -137,6 +153,61 @@ def remove_directory(directory):
         print("Directory does not exist.")
 
 
+def reformat_original_files(final, customer_df, listing_row='Listing', customer_row='ListingBNB', reformat=True):
+    replace_re = "[^A-Za-z0-9_]+"
+    for index, row in final.iterrows():
+        listing = row[listing_row]
+        if not isnan(listing):
+            # Reformat the listing
+            if reformat:
+                listing = unidecode(listing)
+                listing = listing.replace(u'\xa0', u' ')
+                listing = listing.replace(replace_re, ' ')
+                listing = listing.strip()
+            # Find in database
+            customer_info = customer_df[customer_df[customer_row] == listing]
+            if not customer_info.empty:
+                final['Code'].loc[index] = customer_info['Code'].iloc[0]
+                final['Customer'].loc[index] = customer_info['QBO'].iloc[0]
+
+    return final
+
+
+def code_customer(app, cleaning, vrbo, bnb, check, writing_info):
+    app.log('Reformatting original files to include customer codes..')
+
+    replace_re = "[^A-Za-z0-9_]+"
+    # Create a database for listing names
+    cleaning = cleaning[~cleaning.ListingBNB.isnull()]
+    cleaning = cleaning[~cleaning.QBO.isnull()]
+    cleaning['ListingBNB'] = cleaning['ListingBNB'].apply(unidecode)
+    cleaning['ListingBNB'] = cleaning['ListingBNB'].str.replace(u'\xa0', u' ')
+    cleaning['ListingBNB'] = cleaning['ListingBNB'].str.replace(replace_re, ' ', regex=True)
+    cleaning['ListingBNB'] = cleaning['ListingBNB'].str.strip()
+
+    # AirBNB
+    final_bnb = bnb.reindex(columns=["Code", "Customer"] + bnb.columns.tolist())
+    final_bnb = reformat_original_files(final_bnb, cleaning)
+    with pd.ExcelWriter(writing_info['bnb']['path'], engine='xlsxwriter') as writer:
+        final_bnb.to_excel(writer, index=False, sheet_name=writing_info['bnb']['sheet'])
+
+    # Reservations
+    final_check = check.reindex(columns=["Code", "Customer"] + check.columns.tolist())
+    final_check = reformat_original_files(final_check, cleaning)
+    with pd.ExcelWriter(writing_info['check']['path'], engine='xlsxwriter') as writer:
+        final_check.to_excel(writer, index=False, sheet_name=writing_info['check']['sheet'])
+
+    # VRBO
+    final_vrbo = vrbo.reindex(columns=["Code", "Customer"] + vrbo.columns.tolist())
+    final_vrbo = reformat_original_files(final_vrbo, cleaning, 'Property ID', 'VRBO_ID', False)
+    with pd.ExcelWriter(writing_info['vrbo']['path'], engine='xlsxwriter') as writer:
+        final_vrbo.to_excel(writer, index=False, sheet_name=writing_info['vrbo']['sheet'])
+
+    app.log('Reformat complete')
+
+    return
+
+
 #######################################################################################################################
 # Notes
 # Check check and CM dates, make sure that they are set to the first of the month.
@@ -158,7 +229,7 @@ def line_invoice_generation(app):
     month, year = date_from_bnb(filenames[1])
 
     # Beginning ref numbers...
-    invoice_no = reference_number_read()
+    invoice_no, check_no, journal_no = reference_number_read()
 
     # # Date creation for invoice and due dates
     # # Find number of days in the invoice month
@@ -184,7 +255,8 @@ def line_invoice_generation(app):
     month_name = number2month(month)
     # Finishing file
     finish = 'Aviad_BNB_' + month_name + '.xlsx'
-    sheet_names = ['Invoice_fields', 'Credit_Memos_fields', 'Checks_fields', 'Sales_tax_fields']
+    sheet_names = ['Invoices', 'Credit_Memo_Invoices', 'Credit_Memos_fields', 'Checks_fields', 'Sales_tax_fields',
+                   'Sales_Receipts', 'Journal_Entries']
 
     # Item descriptions that are currently desired
     item = ['CLEANING FEE', 'HOSPITALITY TAX', 'MANAGEMENT FEE']
@@ -197,9 +269,12 @@ def line_invoice_generation(app):
     vrbo = pd.DataFrame()
 
     # Create empty dataframes for each set of data to be written to output file
-    entry = pd.DataFrame()
+    entry_NCM = pd.DataFrame()
+    entry_CM = pd.DataFrame()
     sales_entry = pd.DataFrame()
     credit_memo = pd.DataFrame()
+    sales_receipts = pd.DataFrame()
+    journal_entries = pd.DataFrame()
     checks = pd.DataFrame()
     tax_issues = pd.DataFrame()
     man_issues = pd.DataFrame()
@@ -232,6 +307,11 @@ def line_invoice_generation(app):
     num_files = len(os.listdir(filepath))
     progress_vals = np.linspace(3, 15, num=num_files)
     file_idx = 0
+    reformat_info = {
+        'bnb': {'path': '', 'sheet': ''},
+        'check': {'path': '', 'sheet': ''},
+        'vrbo': {'path': '', 'sheet': ''}
+    }
     for fil in os.listdir(filepath):
         app.progress_bar["value"] = int(progress_vals[file_idx])
         app.progress_bar.update()
@@ -242,14 +322,12 @@ def line_invoice_generation(app):
             if fil.lower().startswith(filenames[fname].lower()):
                 if fname == 0:
                     check = pd.read_excel(file)
-
-                    # Copy file to Report Folder
-                    copyfile(filepath + '\\' + fil, path + '\\' + fil)
+                    reformat_info['check']['path'] = path + '\\' + fil
+                    reformat_info['check']['sheet'] = fil
                 elif fname == 1:
                     bnb = pd.read_excel(file)
-
-                    # Copy file to Report Folder
-                    copyfile(filepath + '\\' + fil, path + '\\' + fil)
+                    reformat_info['bnb']['path'] = path + '\\' + fil
+                    reformat_info['bnb']['sheet'] = fil
                 elif fname == 2:
                     xl = pd.ExcelFile(file)
 
@@ -279,9 +357,11 @@ def line_invoice_generation(app):
                         vrbo = pd.read_excel(file)
                     except ValueError:
                         vrbo = pd.read_csv(file)
+                    reformat_info['vrbo']['path'] = path + '\\' + fil
+                    reformat_info['vrbo']['sheet'] = fil
 
-                    # Copy file to Report Folder
-                    copyfile(filepath + '\\' + fil, path + '\\' + fil)
+    # For VRBO, AirBNB, and Reservations append Code and Customer in first columns
+    code_customer(app, cleaning, vrbo, bnb, check, reformat_info)
 
     # Remove any rows including "Resolution" because they are pet fees and should not be included.
     bnb = bnb[~bnb['Type'].isin(['Resolution Payout'])]
@@ -297,6 +377,8 @@ def line_invoice_generation(app):
     # Begin with the columns of the information desired
     replace_re = "[^A-Za-z0-9_ -:&]+"
     bnb_col = pd.DataFrame(bnb, columns=['Listing', 'Amount', 'Type', 'Confirmation Code', 'Nights'])
+    bnb_col.loc[bnb_col["Listing"].isnull(), 'Listing'] = 'NULL'
+    bnb_col['Listing'] = bnb_col['Listing'].apply(unidecode)
     bnb_col['Listing'] = bnb_col['Listing'].str.replace(u'\xa0', u' ')
     bnb_col = bnb_col[~bnb_col.Listing.isnull()]
     bnb_col['Listing'] = bnb_col['Listing'].str.replace(replace_re, ' ', regex=True)
@@ -305,6 +387,8 @@ def line_invoice_generation(app):
     cleaning_col = pd.DataFrame(cleaning,
                                 columns=['ListingBNB', 'QBO', 'Cleaning', 'Tax_Location', 'Pest', 'Landscape',
                                          'Internet/Cable', 'Bus_Lic', 'VRBO_ID', 'Code', 'Output'])
+    cleaning_col.loc[cleaning_col["ListingBNB"].isnull(), 'ListingBNB'] = 'NULL'
+    cleaning_col['ListingBNB'] = cleaning_col['ListingBNB'].apply(unidecode)
     cleaning_col['ListingBNB'] = cleaning_col['ListingBNB'].str.replace(u'\xa0', u' ')
     cleaning_col = cleaning_col[~cleaning_col.ListingBNB.isnull()]
     cleaning_col = cleaning_col[~cleaning_col.QBO.isnull()]
@@ -320,6 +404,8 @@ def line_invoice_generation(app):
     customer_col['Customer-QBO'] = customer_col['Customer-QBO'].str.replace(replace_re, ' ', regex=True)
     customer_col['Customer-QBO'] = customer_col['Customer-QBO'].str.strip()
     check_col = pd.DataFrame(check, columns=['Listing'])
+    check_col.loc[check_col["Listing"].isnull(), 'Listing'] = 'NULL'
+    check_col['Listing'] = check_col['Listing'].apply(unidecode)
     check_col['Listing'] = check_col['Listing'].str.replace(replace_re, ' ', regex=True)
     check_col['Listing'] = check_col['Listing'].str.strip()
     vrbo_col = pd.DataFrame(vrbo, columns=['Property ID', 'Reservation ID', 'Payout', 'Nights', 'Check-out'])
@@ -552,275 +638,353 @@ def line_invoice_generation(app):
     unit['CleaningFee'] = unit['CleaningFee'].apply(pd.to_numeric, errors='coerce')
     unit['CleaningFee'] = unit['CleaningFee'].fillna(0)
 
+    unit.loc[unit["CreditMemo"].isnull(), 'CreditMemo'] = 'NULL'
+    unit_grouped = unit.groupby('CreditMemo')
+
     num_invoices = len(unit_names)
     progress_vals = np.linspace(25, 95, num=num_invoices)
 
-    for n in range(len(unit_names)):
-
-        app.progress_bar["value"] = int(progress_vals[n])
-        app.progress_bar.update()
-
-        # InvoiceNo
-        invoice_no += 1
-
-        # Separate by name
-        unit_loop = unit[unit['Customer'] == unit_names[n]]
-
-        # Customer name
-        customer_name = unit_loop['Customer'].iloc[0]
-
-        # Determine the total income
-        income_total_init = unit_loop['Income'].sum()
-
-        # If VRBO, add to income but keep separate for tax information
-        if not all(unit_loop['VRBO_ID'] == 'none'):
-            income_total = income_total_init + unit_loop['VRBO_PAYOUT'].sum()
+    for ug in range(len(unit_grouped.groups.keys())):
+        entry = pd.DataFrame()
+        if ug == 0:
+            unit = unit_grouped.get_group('CM')
+        elif ug == 1:
+            unit = unit_grouped.get_group('NULL')
         else:
-            income_total = income_total_init
+            app.log('There was an error separating by CM!!! Have Steven look into it please!')
 
-        # Check if un-invoiced
-        un_invoiced = False
-        # If all entries say omit, this is un-invoiced
-        if unit_loop['Clean'].iloc[0] == 'omit' and unit_loop['Hosp'].iloc[0] == 'omit' and \
-                unit_loop['Management'].iloc[
-                    0] == 'omit':
-            un_invoiced = True
+        for n in range(len(unit_names)):
 
-        # Initialization
-        total_cleaning_fee = 0
-        total_amount = 0
-        # management_fee = 0
-        pest_fee = 0
-        bus_lic = 0
-        landscaping_fee = 0
-        cable_fee = 0
-        expense = 0
-        clean_count = 0
-        cleaning_written = False
-        # hospitality_written = False
-        tax_adjustment_90_day = 0
+            app.progress_bar["value"] = int(progress_vals[n])
+            app.progress_bar.update()
 
-        # Separate based on cleaning fee and tax location
-        unique_cleaning = unit_loop['CleaningFee'].unique()
-        unique_tax = unit_loop['TaxLocation'].unique()
+            # InvoiceNo
+            invoice_no += 1
 
-        for tax in unique_tax:
-            # Get Rid Of Later
-            # if code
+            # Separate by name
+            unit_loop = unit[unit['Customer'] == unit_names[n]]
 
-            if not isnan(tax):
-                unit_tax = unit_loop[unit_loop['TaxLocation'] == tax]
-            else:
-                unit_tax = unit_loop[unit_loop['TaxLocation'].isna()]
-
-            for clean in unique_cleaning:
-                unit_repeat = unit_tax[unit_tax['CleaningFee'] == clean]
-                if unit_repeat.empty:
-                    continue
-
-                # Initialize necessary values
-                cleaning_fee = 0
-                num_cleaning_fee = 0
-                amount_less_clean = 0
-                hospitality_tax = 0
-                tax_adjustment_90_day = 0
-
-                # Cleaning fee
-                if not isnan(unit_repeat['CleaningFee'].iloc[0]) or \
-                        not unit_repeat['Clean'].str.contains('omit', case=False).any():
-                    cleaning_fee = unit_repeat['CleaningFee'].iloc[0]
-                    num_cleaning_fee = unit_repeat['Checkouts'].sum()
-                    # Add a cleaning fee for VRBO reports
-                    num_cleaning_fee = num_cleaning_fee + unit_repeat['VRBO_Nights'].sum()
-                    total_cleaning_fee = total_cleaning_fee + cleaning_fee * num_cleaning_fee
-
-                # Hospitality tax
-                if not unit_repeat['Clean'].str.contains('omit', regex=False, case=False).any():
-                    tax_adjustment_90_day = unit_repeat['BNB_90_Day'].sum() + unit_repeat['VRBO_90_Day'].sum()
-                    amount_less_clean = unit_repeat[
-                                            'Income'].sum() - cleaning_fee * num_cleaning_fee - tax_adjustment_90_day
-                    total_amount += amount_less_clean
-                    hospitality_tax = 0.03 * amount_less_clean
-
-                # If the customer has nothing to invoice, skip it
-                if total_cleaning_fee == 0 and unit_repeat['Income'].sum() == 0:
-                    continue
-
-                # Log sales taxes
-                if not hospitality_tax == 0 and not isnan(tax):
-                    sales_entry_new = pd.DataFrame(
-                        [tax, round(amount_less_clean, 2), round(hospitality_tax / 2, 2), round(hospitality_tax / 2, 2),
-                         round(hospitality_tax, 2)])
-                    sales_entry = pd.concat([sales_entry, sales_entry_new.transpose()], ignore_index=True)
-                elif isnan(tax):
-                    tax_issues = pd.concat([tax_issues, unit_repeat], ignore_index=True)
-
-                # Log Cleaning Fee
-                if not un_invoiced:
-                    # Was there a cleaning fee already reported for this customer? If so add this to what is listed
-                    # already.
-                    if not entry.empty:
-                        prev_cleaning = entry[entry[1].str.contains(customer_name, regex=False)]
-                        prev_cleaning = prev_cleaning[prev_cleaning[5].str.contains('CLEANING', regex=False)]
-                        prev_cleaning = prev_cleaning[prev_cleaning[8] == clean]
-
-                    if prev_cleaning.empty:
-                        if not unit_repeat['Clean'].str.contains('del', regex=False, case=False).any():
-                            cleaning_written = True
-                            clean_count += 1
-                            entry_new = pd.DataFrame(
-                                [invoice_no, unit_repeat['Customer'].iloc[0], invoice, due, '', item[0], item[0],
-                                 num_cleaning_fee,
-                                 round(cleaning_fee, 2), round(cleaning_fee * num_cleaning_fee, 2), tax, invoice])
-                            entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
-                    else:
-                        cleaning_written = True
-                        new_cleaning_number = entry.loc[prev_cleaning.index, 7].iloc[0] + num_cleaning_fee
-                        new_cleaning_amount = new_cleaning_number * clean
-                        entry.loc[prev_cleaning.index, 7] = new_cleaning_number
-                        entry.loc[prev_cleaning.index, 9] = new_cleaning_amount
-
-            # If any fee is below 0, then make them 0.
-            total_amount = max(0, total_amount)
-
-            # If the customer has nothing to invoice, skip it
-            if total_cleaning_fee == 0 and total_amount == 0:
+            # Customer name
+            try:
+                customer_name = unit_loop['Customer'].iloc[0]
+            except IndexError:
+                # Because of Credit Memo split, this may be in the other section. Just move on
                 continue
 
-        # If the customer has nothing to invoice, skip it
-        if total_cleaning_fee == 0 and total_amount == 0 and tax_adjustment_90_day == 0 \
-                and unit_loop['VRBO_PAYOUT'].sum() == 0:
-            continue
+            # Determine the total income
+            income_total_init = unit_loop['Income'].sum()
 
-        if not isnan(unit_loop['Expense'].iloc[0]):
-            expense = unit_loop['Expense'].iloc[0]
-        # Management fee
-        total_management = income_total - total_cleaning_fee - expense
-        man_rate = unit_loop['Magpercent'].iloc[0]
-        if isnan(man_rate):
-            if unit_loop['Management'].str.contains('omit', regex=False, case=False).any():
-                man_rate = 0.00
+            # If VRBO, add to income but keep separate for tax information
+            if not all(unit_loop['VRBO_ID'] == 'none'):
+                income_total = income_total_init + unit_loop['VRBO_PAYOUT'].sum()
             else:
-                man_issues = pd.concat([man_issues, unit_loop], ignore_index=True)
-        management_fee = 0.01 * man_rate * total_management
-        if management_fee < 0.00:
-            management_fee = 0.00
+                income_total = income_total_init
 
-        # If any fee is below 0, then make them 0.
-        total_management = max(0, total_management)
+            # Check if un-invoiced
+            un_invoiced = False
+            # If all entries say omit, this is un-invoiced
+            if unit_loop['Clean'].iloc[0] == 'omit' and unit_loop['Hosp'].iloc[0] == 'omit' and \
+                    unit_loop['Management'].iloc[
+                        0] == 'omit':
+                un_invoiced = True
 
-        # Create the memo
-        # Change formatting of memo values
-        income_memo = '${0:,.2f}'.format(round(income_total, 2))
-        expense_memo = '${0:,.2f}'.format(round(expense, 2))
-        cleaning_memo = '${0:,.2f}'.format(round(total_cleaning_fee, 2))
-        total_memo = '${0:,.2f}'.format(round(total_management, 2))
-        manage_memo = '${0:,.2f}'.format(round(management_fee, 2))
+            # Initialization
+            total_cleaning_fee = 0
+            total_amount = 0
+            # management_fee = 0
+            pest_fee = 0
+            bus_lic = 0
+            landscaping_fee = 0
+            cable_fee = 0
+            expense = 0
+            clean_count = 0
+            cleaning_written = False
+            # hospitality_written = False
+            tax_adjustment_90_day = 0
 
-        # If cleaning fee or expenses are 0, do not include in memo
-        memo = 'INCOME ' + income_memo
-        if total_cleaning_fee != 0:
-            memo += ' - CLEANING ' + cleaning_memo
-        if expense != 0:
-            memo += ' - EXPENSES ' + expense_memo
-        memo += ' = ' + total_memo + ' | MANAGEMENT FEE ' + str(man_rate) + '% --> ' + manage_memo
+            # Separate based on cleaning fee and tax location
+            unique_cleaning = unit_loop['CleaningFee'].unique()
+            unique_tax = unit_loop['TaxLocation'].unique()
 
-        # Place the memo in the cleaning fee and hospitality tax sections
-        if cleaning_written:
-            entry.iloc[-1, 4] = memo
-            for cl in (n + 2 for n in range(clean_count - 1)):
-                entry.iloc[-cl, 4] = memo
+            for tax in unique_tax:
+                # Get Rid Of Later
+                # if code
 
-        # Log Management Fee
-        tax_location = entry.iloc[-1, 10]
-        if not unit_loop['Management'].iloc[0] == 'omit':
-            if not unit_loop['Management'].str.contains('del', regex=False, case=False).any():
+                if not isnan(tax):
+                    unit_tax = unit_loop[unit_loop['TaxLocation'] == tax]
+                else:
+                    unit_tax = unit_loop[unit_loop['TaxLocation'].isna()]
+
+                for clean in unique_cleaning:
+                    unit_repeat = unit_tax[unit_tax['CleaningFee'] == clean]
+                    if unit_repeat.empty:
+                        continue
+
+                    # Initialize necessary values
+                    cleaning_fee = 0
+                    num_cleaning_fee = 0
+                    amount_less_clean = 0
+                    hospitality_tax = 0
+                    tax_adjustment_90_day = 0
+
+                    # Cleaning fee
+                    if not isnan(unit_repeat['CleaningFee'].iloc[0]) or \
+                            not unit_repeat['Clean'].str.contains('omit', case=False).any():
+                        cleaning_fee = unit_repeat['CleaningFee'].iloc[0]
+                        num_cleaning_fee = unit_repeat['Checkouts'].sum()
+                        # Add a cleaning fee for VRBO reports
+                        num_cleaning_fee = num_cleaning_fee + unit_repeat['VRBO_Nights'].sum()
+                        total_cleaning_fee = total_cleaning_fee + cleaning_fee * num_cleaning_fee
+
+                    # Hospitality tax
+                    if not unit_repeat['Clean'].str.contains('omit', regex=False, case=False).any():
+                        tax_adjustment_90_day = unit_repeat['BNB_90_Day'].sum() + unit_repeat['VRBO_90_Day'].sum()
+                        amount_less_clean = unit_repeat[
+                                                'Income'].sum() - cleaning_fee * num_cleaning_fee - tax_adjustment_90_day
+                        total_amount += amount_less_clean
+                        hospitality_tax = 0.03 * amount_less_clean
+
+                    # If the customer has nothing to invoice, skip it
+                    if total_cleaning_fee == 0 and unit_repeat['Income'].sum() == 0:
+                        continue
+
+                    # Log sales taxes
+                    if not hospitality_tax == 0 and not isnan(tax):
+                        sales_entry_new = pd.DataFrame(
+                            [tax, round(amount_less_clean, 2), round(hospitality_tax / 2, 2),
+                             round(hospitality_tax / 2, 2),
+                             round(hospitality_tax, 2)])
+                        sales_entry = pd.concat([sales_entry, sales_entry_new.transpose()], ignore_index=True)
+                    elif isnan(tax):
+                        tax_issues = pd.concat([tax_issues, unit_repeat], ignore_index=True)
+
+                    # Log Cleaning Fee
+                    if not un_invoiced:
+                        # Was there a cleaning fee already reported for this customer? If so add this to what is listed
+                        # already.
+                        if not entry.empty:
+                            prev_cleaning = entry[entry[1].str.contains(customer_name, regex=False)]
+                            prev_cleaning = prev_cleaning[prev_cleaning[5].str.contains('CLEANING', regex=False)]
+                            prev_cleaning = prev_cleaning[prev_cleaning[8] == clean]
+
+                        if prev_cleaning.empty:
+                            if not unit_repeat['Clean'].str.contains('del', regex=False, case=False).any():
+                                cleaning_written = True
+                                clean_count += 1
+                                entry_new = pd.DataFrame(
+                                    [invoice_no, unit_repeat['Customer'].iloc[0], invoice, due, '', item[0], item[0],
+                                     num_cleaning_fee,
+                                     round(cleaning_fee, 2), round(cleaning_fee * num_cleaning_fee, 2), tax, invoice])
+                                entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+                        else:
+                            cleaning_written = True
+                            new_cleaning_number = entry.loc[prev_cleaning.index, 7].iloc[0] + num_cleaning_fee
+                            new_cleaning_amount = new_cleaning_number * clean
+                            entry.loc[prev_cleaning.index, 7] = new_cleaning_number
+                            entry.loc[prev_cleaning.index, 9] = new_cleaning_amount
+
+                # If any fee is below 0, then make them 0.
+                total_amount = max(0, total_amount)
+
+                # If the customer has nothing to invoice, skip it
+                if total_cleaning_fee == 0 and total_amount == 0:
+                    continue
+
+            # If the customer has nothing to invoice, skip it
+            if total_cleaning_fee == 0 and total_amount == 0 and tax_adjustment_90_day == 0 \
+                    and unit_loop['VRBO_PAYOUT'].sum() == 0:
+                continue
+
+            if not isnan(unit_loop['Expense'].iloc[0]):
+                expense = unit_loop['Expense'].iloc[0]
+            # Management fee
+            total_management = income_total - total_cleaning_fee - expense
+            man_rate = unit_loop['Magpercent'].iloc[0]
+            if isnan(man_rate):
+                if unit_loop['Management'].str.contains('omit', regex=False, case=False).any():
+                    man_rate = 0.00
+                else:
+                    man_issues = pd.concat([man_issues, unit_loop], ignore_index=True)
+            management_fee = 0.01 * man_rate * total_management
+            if management_fee < 0.00:
+                management_fee = 0.00
+
+            # If any fee is below 0, then make them 0.
+            total_management = max(0, total_management)
+
+            # Create the memo
+            # Change formatting of memo values
+            income_memo = '${0:,.2f}'.format(round(income_total, 2))
+            expense_memo = '${0:,.2f}'.format(round(expense, 2))
+            cleaning_memo = '${0:,.2f}'.format(round(total_cleaning_fee, 2))
+            total_memo = '${0:,.2f}'.format(round(total_management, 2))
+            manage_memo = '${0:,.2f}'.format(round(management_fee, 2))
+
+            # If cleaning fee or expenses are 0, do not include in memo
+            memo = 'INCOME ' + income_memo
+            if total_cleaning_fee != 0:
+                memo += ' - CLEANING ' + cleaning_memo
+            if expense != 0:
+                memo += ' - EXPENSES ' + expense_memo
+            memo += ' = ' + total_memo + ' | MANAGEMENT FEE ' + str(man_rate) + '% --> ' + manage_memo
+
+            # Place the memo in the cleaning fee and hospitality tax sections
+            if cleaning_written:
+                entry.iloc[-1, 4] = memo
+                for cl in (n + 2 for n in range(clean_count - 1)):
+                    entry.iloc[-cl, 4] = memo
+
+            # Log Management Fee
+            tax_location = entry.iloc[-1, 10]
+            if not unit_loop['Management'].iloc[0] == 'omit':
+                if not unit_loop['Management'].str.contains('del', regex=False, case=False).any():
+                    entry_new = pd.DataFrame(
+                        [invoice_no, customer_name, invoice, due, memo, item[2], item[2], 0.01 * man_rate,
+                         round(total_management, 2), round(management_fee, 2), tax_location, invoice])
+                    entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+
+            # Log Pest Control Fee
+            if not unit_loop['Pest'].isnull().values.all():
+                pest_fee = unit_loop['Pest'].sum()
                 entry_new = pd.DataFrame(
-                    [invoice_no, customer_name, invoice, due, memo, item[2], item[2], 0.01 * man_rate,
-                     round(total_management, 2), round(management_fee, 2), tax_location, invoice])
+                    [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'PEST CONTROL', 1,
+                     round(pest_fee, 2), round(pest_fee, 2), tax_location, invoice])
                 entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
 
-        # Log Pest Control Fee
-        if not unit_loop['Pest'].isnull().values.all():
-            pest_fee = unit_loop['Pest'].sum()
-            entry_new = pd.DataFrame(
-                [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'PEST CONTROL', 1,
-                 round(pest_fee, 2), round(pest_fee, 2), tax_location, invoice])
-            entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+            # Log Landscaping Fee
+            if not unit_loop['Landscape'].isnull().values.all():
+                landscaping_fee = unit_loop['Landscape'].sum()
+                entry_new = pd.DataFrame(
+                    [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'LANDSCAPING', 1,
+                     round(landscaping_fee, 2), round(landscaping_fee, 2), tax_location, invoice])
+                entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
 
-        # Log Landscaping Fee
-        if not unit_loop['Landscape'].isnull().values.all():
-            landscaping_fee = unit_loop['Landscape'].sum()
-            entry_new = pd.DataFrame(
-                [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'LANDSCAPING', 1,
-                 round(landscaping_fee, 2), round(landscaping_fee, 2), tax_location, invoice])
-            entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+            # Log Internet/Cable Fee
+            if not unit_loop['Internet/Cable'].isnull().values.all():
+                cable_fee = unit_loop['Internet/Cable'].sum()
+                entry_new = pd.DataFrame(
+                    [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'INTERNET_CABLE', 1,
+                     round(cable_fee, 2), round(cable_fee, 2), tax_location, invoice])
+                entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
 
-        # Log Internet/Cable Fee
-        if not unit_loop['Internet/Cable'].isnull().values.all():
-            cable_fee = unit_loop['Internet/Cable'].sum()
-            entry_new = pd.DataFrame(
-                [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'INTERNET_CABLE', 1,
-                 round(cable_fee, 2), round(cable_fee, 2), tax_location, invoice])
-            entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+            # Log Pest Control Fee
+            if not unit_loop['Bus_Lic'].isnull().values.all():
+                bus_lic = unit_loop['Bus_Lic'].sum()
+                entry_new = pd.DataFrame(
+                    [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'BUSINESS LICENSE', 1,
+                     round(bus_lic, 2), round(bus_lic, 2), tax_location, invoice])
+                entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
 
-        # Log Pest Control Fee
-        if not unit_loop['Bus_Lic'].isnull().values.all():
-            bus_lic = unit_loop['Bus_Lic'].sum()
-            entry_new = pd.DataFrame(
-                [invoice_no, customer_name, invoice, due, memo, 'SERVICES', 'BUSINESS LICENSE', 1,
-                 round(bus_lic, 2), round(bus_lic, 2), tax_location, invoice])
-            entry = pd.concat([entry, entry_new.transpose()], ignore_index=True)
+            # Credit Memo/Checks
+            if (unit_loop['CreditMemo'] == 'CM').any():
+                # Create item description for Credit Memo
+                item_cm = 'Deposits in Trust'
+                item_cm_desc = 'Funds Collected on Behalf of Client'
 
-        # Credit Memo/Checks
-        if not unit_loop['CreditMemo'].isnull().values.all():
-            # Create item description for Credit Memo
-            item_cm = 'Deposits in Trust'
-            item_cm_desc = 'Funds Collected on Behalf of Client'
+                # Log Credit Memo
+                credit_memo_new = pd.DataFrame(
+                    [invoice_no, customer_name, invoice, invoice, item_cm, item_cm_desc,
+                     1, round(income_total, 2), round(income_total, 2), tax_location])
+                credit_memo = pd.concat([credit_memo, credit_memo_new.transpose()], ignore_index=True)
 
-            # Log Credit Memo
-            credit_memo_new = pd.DataFrame(
-                [invoice_no, customer_name, invoice, invoice, item_cm, item_cm_desc,
-                 1, round(income_total, 2), round(income_total, 2), tax_location])
-            credit_memo = pd.concat([credit_memo, credit_memo_new.transpose()], ignore_index=True)
+                # Sales Receipts
+                item_sr = 'TRUST Clearing Account'
+                bnb_sales = False
+                vrbo_sales = False
+                bnb_income = unit_loop['Income'].sum()
+                vrbo_income = unit_loop['VRBO_PAYOUT'].sum()
+                total_sale_amt = round(bnb_income + vrbo_income, 2)
+                if not bnb_income == 0.0:
+                    bnb_sales = True
+                if not vrbo_income == 0.0:
+                    vrbo_sales = True
+                if bnb_sales and not vrbo_sales:
+                    pmnt_meth = 'AirBNB'
+                elif not bnb_sales and vrbo_sales:
+                    pmnt_meth = 'VRBO'
+                elif bnb_sales and vrbo_sales:
+                    pmnt_meth = 'BOTH'
+                else:
+                    pmnt_meth = ''
 
-            # Checks
-            # Reference number
-            ref_num = 'ABB ACH'
-            # Bank Account
-            bank = 'Anderson Brothers # 9005'
+                bnb_income = '${0:,.2f}'.format(round(bnb_income, 2))
+                vrbo_income = '${0:,.2f}'.format(round(vrbo_income, 2))
+                sales_msg = f'Receipt income in trust from - AirBNB Amount: {bnb_income} | VRBO Amount: {vrbo_income}'
+                line_itm = 'Rents in trust - Liability'
 
-            # Expense descriptions
-            expense_desc_object = datetime.datetime.strptime(str(month), '%m')
-            expense_desc_month = expense_desc_object.strftime('%B')
-            expense_desc = expense_desc_month + ' Earning'
-            expense_acc = 'Accounts Receivable (A/R)'
+                # Log Sales Receipts
+                sr_new = pd.DataFrame(
+                    [invoice_no, customer_name, invoice, tax_location, item_sr, pmnt_meth,
+                     sales_msg, 'N', 'N', invoice, line_itm, sales_msg, 1, total_sale_amt, total_sale_amt, 'NON'])
+                sales_receipts = pd.concat([sales_receipts, sr_new.transpose()], ignore_index=True)
 
-            # Create an expense amount by taking the total income and subtracting the total cleaning fees, the
-            # hospitality tax and the management fee.
-            total_invoice = round(
-                total_cleaning_fee + management_fee + pest_fee + bus_lic + landscaping_fee + cable_fee,
-                2)
-            expense_amt = income_total - total_invoice
+                # Journal Entries
+                ref_num = 'PMT ' + f'{journal_no:05d}'
+                customer = unit_loop['Customer'].iloc[0]
+                prvt_note = f'Payment {customer} to #{invoice_no}'
+                debit_acct = 'Accounts Receivable (A/R)'
+                credit_acct = 'ABB Trust #5241'
 
-            # Memo
-            income_check_memo = '${0:,.2f}'.format(round(income_total, 2))
-            total_invoice_memo = '${0:,.2f}'.format(round(total_invoice, 2))
-            expense_check_memo = '${0:,.2f}'.format(round(expense_amt, 2))
-            private_note = 'INCOME ' + income_check_memo + ' - CREDIT MEMO APPLIED TO INVOICE ' + total_invoice_memo + \
-                           ' = MONTHLY EARNINGS ' + expense_check_memo
+                # Log Journal Entries
+                # Debit
+                je_new = pd.DataFrame(
+                    [ref_num, invoice, prvt_note, 'False', debit_acct, income_total, debit_acct, tax_location,
+                     customer])
+                journal_entries = pd.concat([journal_entries, je_new.transpose()], ignore_index=True)
+                # Credit
+                je_new = pd.DataFrame(
+                    [ref_num, invoice, prvt_note, 'False', credit_acct, -income_total, credit_acct, tax_location,
+                     customer])
+                journal_entries = pd.concat([journal_entries, je_new.transpose()], ignore_index=True)
+                journal_no += 1
 
-            checks_new = pd.DataFrame(
-                [ref_num, bank, invoice, customer_name, expense_amt, private_note, expense_desc,
-                 expense_acc])
-            checks = pd.concat([checks, checks_new.transpose()], ignore_index=True)
+                # Checks
+                # Reference number
+                ref_num = 'ABB TR ' + f'{check_no:05d}'
+                # Bank Account
+                bank = 'ABB Trust #5241'
+
+                # Expense descriptions
+                expense_desc_object = datetime.datetime.strptime(str(month), '%m')
+                expense_desc_month = expense_desc_object.strftime('%B')
+                expense_desc = expense_desc_month + ' Earning'
+                expense_acc = 'Accounts Receivable (A/R)'
+
+                # Create an expense amount by taking the total income and subtracting the total cleaning fees, the
+                # hospitality tax and the management fee.
+                total_invoice = round(
+                    total_cleaning_fee + management_fee + pest_fee + bus_lic + landscaping_fee + cable_fee,
+                    2)
+                expense_amt = income_total - total_invoice
+
+                # Memo
+                income_check_memo = '${0:,.2f}'.format(round(income_total, 2))
+                total_invoice_memo = '${0:,.2f}'.format(round(total_invoice, 2))
+                expense_check_memo = '${0:,.2f}'.format(round(expense_amt, 2))
+                private_note = 'INCOME ' + income_check_memo + ' - CREDIT MEMO APPLIED TO INVOICE ' + total_invoice_memo + \
+                               ' = MONTHLY EARNINGS ' + expense_check_memo
+
+                checks_new = pd.DataFrame(
+                    [ref_num, bank, invoice, customer_name, expense_amt, private_note, expense_desc,
+                     expense_acc])
+                checks = pd.concat([checks, checks_new.transpose()], ignore_index=True)
+                check_no += 1
+
+        if ug == 0:
+            entry_CM = entry
+        elif ug == 1:
+            entry_NCM = entry
+        else:
+            app.log('There was an error separating by CM!!! Have Steven look into it please!')
 
     # Save the final invoice number
-    reference_number_write(invoice_no - 1, month, year)
+    reference_number_write(invoice_no - 1, check_no, journal_no, month, year)
 
     # Create field names for entry and sales_entry
-    entry.columns = ['RefNumber', 'Customer', 'TxnDate', 'DueDate', 'Msg', 'LineItem', 'LineDesc', 'LineQty',
-                     'LineUnitPrice', 'LineAmount', 'Location', 'LineServiceDate']
+    entry_CM.columns = ['RefNumber', 'Customer', 'TxnDate', 'DueDate', 'Msg', 'LineItem', 'LineDesc', 'LineQty',
+                        'LineUnitPrice', 'LineAmount', 'Location', 'LineServiceDate']
+    entry_NCM.columns = ['RefNumber', 'Customer', 'TxnDate', 'DueDate', 'Msg', 'LineItem', 'LineDesc', 'LineQty',
+                         'LineUnitPrice', 'LineAmount', 'Location', 'LineServiceDate']
     sales_entry.columns = ['Tax_Location', 'Income', 'Municipality', 'County', 'Hospitality_Tax']
 
     # Create field names for credit_memo and checks
@@ -828,10 +992,17 @@ def line_invoice_generation(app):
                            'LineQty', 'LineUnitPrice', 'LineAmount', 'Location']
     checks.columns = ['RefNumber', 'BankAccount', 'TxnDate', 'Vendor', 'ExpenseAmount', 'PrivateNote', 'ExpenseDesc',
                       'ExpenseAccount']
+    sales_receipts.columns = ['RefNumber', 'Customer', 'TxnDate', 'Location', 'BankAccount', 'PaymentMethod', 'Msg',
+                              'ToBePrinted', 'ToBeEmailed', 'LineServiceDate', 'LineItem', 'LineDesc', 'LineQty',
+                              'LineUnitPrice', 'LineAmount', 'LineTaxable']
+    journal_entries.columns = ['RefNumber', 'TxnDate', 'PrivateNote', 'IsAdjustment', 'Account', 'LineAmount',
+                               'LineDesc', 'Location', 'Customer']
 
     # Change data type and apply formatting to specific columns
-    entry['LineUnitPrice'] = entry['LineUnitPrice'].astype(float)  # ItemRate
-    entry['LineAmount'] = entry['LineAmount'].astype(float)  # ItemAmount
+    entry_CM['LineUnitPrice'] = entry_CM['LineUnitPrice'].astype(float)  # ItemRate
+    entry_CM['LineAmount'] = entry_CM['LineAmount'].astype(float)  # ItemAmount
+    entry_NCM['LineUnitPrice'] = entry_NCM['LineUnitPrice'].astype(float)  # ItemRate
+    entry_NCM['LineAmount'] = entry_NCM['LineAmount'].astype(float)  # ItemAmount
     credit_memo['LineUnitPrice'] = credit_memo['LineUnitPrice'].astype(float)  # ItemRate
     credit_memo['LineAmount'] = credit_memo['LineAmount'].astype(float)  # ItemAmount
     checks['ExpenseAmount'] = checks['ExpenseAmount'].astype(float)  # Expense Amount
@@ -851,11 +1022,17 @@ def line_invoice_generation(app):
         sales_idx = sales_entry[sales_entry['Tax_Location'] == i]
 
         # Sum the values
-        sales_data = sales_idx.sum()
-        sales_data_fix = sales_data.replace(sales_data['Tax_Location'], i)
+        s_inc = sales_idx['Income'].sum()
+        s_mun = sales_idx['Municipality'].sum()
+        s_co = sales_idx['County'].sum()
+        s_hosp = sales_idx['Hospitality_Tax'].sum()
+        t_loc = sales_idx['Tax_Location'].iloc[0]
 
         # Create the final sales data array from these values
-        fin_sales = pd.concat([fin_sales, sales_data_fix], ignore_index=True)
+        new_s = pd.DataFrame([t_loc, s_inc, s_mun, s_co, s_hosp])
+        fin_sales = pd.concat([fin_sales, new_s.transpose()], ignore_index=True)
+
+    fin_sales.columns = sales_entry.columns
 
     # When writing to excel, format the data columns with accounting format for easier viewing.
     # Create a Pandas Excel writer using XlsxWriter as the engine.
@@ -875,13 +1052,21 @@ def line_invoice_generation(app):
                     col_index = df.columns.get_loc(col)
                     writer.sheets[xl_sht_name].set_column(col_index, col_index, math.ceil(column_wid * 1.25))
 
-            if i == 'Invoice_fields':
-                entry.to_excel(writer, index=False, sheet_name=i)
+            if i == 'Invoices':
+                entry_NCM.to_excel(writer, index=False, sheet_name=i)
                 # Note: It isn't possible to format any cells that already have a format such
                 # as the index or headers or any cells that contain dates or datetimes.
 
                 # Auto-adjust columns' width
-                get_col_widths(entry, i)
+                get_col_widths(entry_NCM, i)
+
+            elif i == 'Credit_Memo_Invoices':
+                entry_CM.to_excel(writer, index=False, sheet_name=i)
+                # Note: It isn't possible to format any cells that already have a format such
+                # as the index or headers or any cells that contain dates or datetimes.
+
+                # Auto-adjust columns' width
+                get_col_widths(entry_CM, i)
 
             elif i == 'Credit_Memos_fields':
                 credit_memo.to_excel(writer, index=False, sheet_name=i)
@@ -915,6 +1100,22 @@ def line_invoice_generation(app):
                 # Format Accounting cells
                 worksheet.set_column(1, 4, 18, format_col)
                 worksheet.set_column(0, 0, 12)
+
+            elif i == 'Sales_Receipts':
+                sales_receipts.to_excel(writer, index=False, sheet_name=i)
+                # Note: It isn't possible to format any cells that already have a format such
+                # as the index or headers or any cells that contain dates or datetimes.
+
+                # Auto-adjust columns' width
+                get_col_widths(sales_receipts, i)
+
+            elif i == 'Journal_Entries':
+                journal_entries.to_excel(writer, index=False, sheet_name=i)
+                # Note: It isn't possible to format any cells that already have a format such
+                # as the index or headers or any cells that contain dates or datetimes.
+
+                # Auto-adjust columns' width
+                get_col_widths(journal_entries, i)
 
             # If there needs to be a sheet containing missing information, place here:
             if not listing_diff.empty:
